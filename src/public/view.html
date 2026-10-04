@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>View</title>
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; background: transparent; overflow: hidden; }
+  video { width: 100%; height: 100%; object-fit: contain; background: transparent; }
+  #dbg { position: fixed; left: 8px; top: 8px; color: #0f0; font: 14px monospace; text-shadow: 0 0 3px #000; display: none; }
+</style>
+</head>
+<body>
+<video id="v" autoplay playsinline></video>
+<div id="dbg"></div>
+
+<script>
+// ?debug=1 - get state ?mute=1 no audio
+const q = new URLSearchParams(location.search);
+const v = document.getElementById('v'), dbg = document.getElementById('dbg');
+if (q.get('debug')) dbg.style.display = 'block';
+if (q.get('mute')) v.muted = true;
+if (q.get('fit')) v.style.objectFit = q.get('fit');
+const log = t => dbg.textContent = t;
+
+let ws, pc;
+
+function connect() {
+  ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws?role=viewer`);
+  ws.onopen = () => log('Ожидание трансляции...');
+  ws.onclose = () => { log('Нет связи с сервером'); setTimeout(connect, 1000); };
+  ws.onmessage = async e => {
+    const m = JSON.parse(e.data);
+    if (m.type === 'streamer-ready') {
+      ws.send(JSON.stringify({ type: 'join' }));
+    } else if (m.type === 'streamer-left') {
+      reset(); log('Трансляция остановлена');
+    } else if (m.type === 'offer') {
+      reset();
+      pc = new RTCPeerConnection({ iceServers: [] });
+      pc.ontrack = ev => {
+        v.srcObject = ev.streams[0];
+        v.play().catch(() => { v.muted = true; v.play().catch(() => {}); });
+        log('В эфире');
+      };
+      pc.onicecandidate = ev => ev.candidate && ws.send(JSON.stringify({ type: 'ice', candidate: ev.candidate }));
+      pc.onconnectionstatechange = () => {
+        if (pc && ['failed', 'disconnected'].includes(pc.connectionState)) { log('Связь потеряна'); ws.send(JSON.stringify({ type: 'join' })); }
+      };
+      await pc.setRemoteDescription(m.sdp);
+      await pc.setLocalDescription(await pc.createAnswer());
+      ws.send(JSON.stringify({ type: 'answer', sdp: pc.localDescription }));
+    } else if (m.type === 'ice' && pc && m.candidate) {
+      pc.addIceCandidate(m.candidate).catch(() => {});
+    }
+  };
+}
+
+function reset() {
+  if (pc) { pc.close(); pc = null; }
+  v.srcObject = null;
+}
+
+connect();
+</script>
+</body>
+</html>

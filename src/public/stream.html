@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stream</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; font-family: system-ui, sans-serif; background: #111; color: #eee; padding: 12px; }
+  video { width: 100%; max-height: 55vh; background: #000; border-radius: 8px; object-fit: contain; }
+  .row { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  select, button { flex: 1; padding: 12px; font-size: 16px; border-radius: 8px; border: 0; background: #2a2a2a; color: #eee; }
+  button.main { background: #2e7d32; font-weight: 600; }
+  button.stop { background: #c62828; }
+  label { display: flex; align-items: center; gap: 6px; padding: 8px; }
+  #status { margin-top: 10px; font-size: 14px; opacity: .8; }
+  #stats { margin-top: 6px; font: 12px monospace; opacity: .7; white-space: pre-line; }
+</style>
+</head>
+<body>
+<video id="preview" autoplay playsinline muted></video>
+
+<div class="row">
+  <select id="camera">
+    <option value="user">Фронтальная</option>
+    <option value="environment" selected>Основная</option>
+  </select>
+  <select id="res">
+    <option value="1280x720">720p</option>
+    <option value="1920x1080" selected>1080p</option>
+    <option value="2560x1440">2K (1440p)</option>
+    <option value="3840x2160">4K</option>
+    <option value="854x480">480p</option>
+  </select>
+</div>
+<div class="row">
+  <select id="fps">
+    <option value="30" selected>30 fps</option>
+    <option value="60">60 fps</option>
+    <option value="24">24 fps</option>
+  </select>
+  <select id="bitrate">
+    <option value="5000000">5 Мбит/с</option>
+    <option value="10000000">10 Мбит/с</option>
+    <option value="20000000" >20 Мбит/с</option>
+    <option value="35000000" selected>35 Мбит/с</option>
+    <option value="50000000">50 Мбит/с</option>
+    <option value="80000000">80 Мбит/с</option>
+    <option value="100000000">100 Мбит/с</option>
+  </select>
+  <label><input type="checkbox" id="audio"> звук</label>
+</div>
+<div class="row">
+  <select id="codec">
+    <option value="H264" selected>Кодек: H.264</option>
+    <option value="auto">Кодек: авто</option>
+    <option value="VP8">Кодек: VP8</option>
+    <option value="VP9">Кодек: VP9</option>
+    <option value="AV1">Кодек: AV1</option>
+  </select>
+</div>
+<div class="row">
+  <select id="degr">
+    <option value="balanced" selected>Перегруз: balanced</option>
+    <option value="maintain-framerate">Перегруз: держать fps</option>
+    <option value="maintain-resolution">Перегруз: держать разрешение</option>
+  </select>
+</div>
+<div class="row">
+  <label><input type="checkbox" id="exact" checked> строго (exact)</label>
+  <label><input type="checkbox" id="boost"> ускор. старт битрейта</label>
+</div>
+<div class="row">
+  <button id="btn" class="main">Старт</button>
+</div>
+<div id="status">Не запущено</div>
+<div id="stats"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const preview = $('preview'), btn = $('btn'), statusEl = $('status');
+
+let ws, stream = null, wakeLock = null, running = false;
+const peers = new Map();  
+const viewerIds = new Set();
+
+const setStatus = t => statusEl.textContent = t;
+const wsSend = m => ws && ws.readyState === 1 && ws.send(JSON.stringify(m));
+
+function connectWs() {
+  ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws?role=streamer`);
+  ws.onopen = () => setStatus(stream ? 'В эфире' : 'Подключено к серверу');
+  ws.onclose = () => { if (running) { setStatus('Переподключение...'); setTimeout(connectWs, 1000); } };
+  ws.onmessage = async e => {
+    const m = JSON.parse(e.data);
+    if (m.type === 'join') { viewerIds.add(m.from); if (stream) await offerTo(m.from); }
+    else if (m.type === 'leave') { viewerIds.delete(m.from); closePeer(m.from); }
+    else if (m.type === 'answer') { const pc = peers.get(m.from); pc && await pc.setRemoteDescription({ type: m.sdp.type, sdp: $('boost').checked ? boostSdp(m.sdp.sdp) : m.sdp.sdp }); }
+    else if (m.type === 'ice') { const pc = peers.get(m.from); pc && m.candidate && pc.addIceCandidate(m.candidate).catch(() => {}); }
+    updateStatus();
+  };
+}
+
+function updateStatus() {
+  if (running) setStatus(`В эфире. Зрителей: ${viewerIds.size}`);
+}
+
+function closePeer(id) {
+  const pc = peers.get(id);
+  if (pc) { pc.close(); peers.delete(id); }
+}
+
+async function offerTo(id) {
+  closePeer(id);
+  const pc = new RTCPeerConnection({ iceServers: [] });
+  peers.set(id, pc);
+  stream.getTracks().forEach(t => pc.addTrack(t, stream));
+  preferCodec(pc);
+  pc.onicecandidate = e => e.candidate && wsSend({ to: id, type: 'ice', candidate: e.candidate });
+  await pc.setLocalDescription(await pc.createOffer());
+  wsSend({ to: id, type: 'offer', sdp: pc.localDescription });
+  applyBitrate(pc);
+}
+
+async function applyBitrate(pc) {
+  const bps = +$('bitrate').value;
+  for (const s of pc.getSenders()) {
+    if (s.track && s.track.kind === 'video') {
+      const p = s.getParameters();
+      if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+      p.encodings[0].maxBitrate = bps;
+      p.degradationPreference = $('degr').value;
+      try { await s.setParameters(p); } catch {}
+    }
+  }
+}
+
+async function getMedia() {
+  const [w, h] = $('res').value.split('x').map(Number);
+  const fps = +$('fps').value;
+  const k = $('exact').checked ? 'exact' : 'ideal';
+  return navigator.mediaDevices.getUserMedia({
+    video: { facingMode: $('camera').value, width: { [k]: w }, height: { [k]: h }, frameRate: { [k]: fps } },
+    audio: $('audio').checked
+  });
+}
+
+async function start() {
+  if (!navigator.mediaDevices) { setStatus('Нужен HTTPS! Открой https://...:3443'); return; }
+  try { stream = await getMedia(); } catch (e) { setStatus('Ошибка камеры: ' + e.name + (e.constraint ? ' (' + e.constraint + ' не поддерживается, сними "строго")' : ': ' + e.message)); return; }
+  preview.srcObject = stream;
+  running = true;
+  btn.textContent = 'Стоп'; btn.className = 'stop';
+  try { wakeLock = await navigator.wakeLock.request('screen'); } catch {}
+  connectWs();
+  for (const id of viewerIds) offerTo(id);
+  setStatus('В эфире');
+}
+
+function stop() {
+  running = false;
+  for (const id of [...peers.keys()]) closePeer(id);
+  viewerIds.clear();
+  stream && stream.getTracks().forEach(t => t.stop());
+  stream = null; preview.srcObject = null;
+  ws && ws.close();
+  wakeLock && wakeLock.release().catch(() => {}); wakeLock = null;
+  btn.textContent = 'Старт'; btn.className = 'main';
+  setStatus('Остановлено');
+}
+
+
+function preferCodec(pc) {
+  const codec = $('codec').value;
+  if (codec === 'auto' || !RTCRtpSender.getCapabilities) return;
+  const caps = RTCRtpSender.getCapabilities('video').codecs;
+  const pref = caps.filter(c => c.mimeType === 'video/' + codec);
+  if (!pref.length) return;
+  const rest = caps.filter(c => c.mimeType !== 'video/' + codec);
+  pc.getTransceivers().forEach(t => {
+    if (t.sender.track && t.sender.track.kind === 'video') {
+      try { t.setCodecPreferences([...pref, ...rest]); } catch {}
+    }
+  });
+}
+function boostSdp(sdp) {
+  try {
+    const max = +$('bitrate').value / 1000;
+    const min = Math.round(max * 0.3), start = Math.round(max * 0.6);
+    const extra = `x-google-min-bitrate=${min};x-google-start-bitrate=${start};x-google-max-bitrate=${max}`;
+    const lines = sdp.split('\r\n');
+    const out = [];
+    let inVideo = false;
+    const hasFmtp = new Set();
+    lines.forEach(l => { const m = l.match(/^a=fmtp:(\d+) /); if (m) hasFmtp.add(m[1]); });
+    for (const l of lines) {
+      if (l.startsWith('m=')) inVideo = l.startsWith('m=video');
+      const fm = l.match(/^a=fmtp:(\d+) (.*)/);
+      if (inVideo && fm && !/apt=/.test(fm[2])) { out.push(l + ';' + extra); continue; }
+      out.push(l);
+      const rm = l.match(/^a=rtpmap:(\d+) (\w+)\//);
+      if (inVideo && rm && !hasFmtp.has(rm[1]) && !/^(rtx|red|ulpfec|flexfec-03)$/i.test(rm[2]))
+        out.push(`a=fmtp:${rm[1]} ${extra}`);
+    }
+    return out.join('\r\n');
+  } catch { return sdp; }
+}
+setInterval(async () => {
+  const el = $('stats');
+  const pc = [...peers.values()][0];
+  if (!running || !pc || !stream) { el.textContent = ''; return; }
+  try {
+    const cap = (stream.getVideoTracks()[0] || { getSettings: () => ({}) }).getSettings();
+    const st = await pc.getStats();
+    st.forEach(r => {
+      if (r.type === 'outbound-rtp' && r.kind === 'video') {
+        const lim = r.qualityLimitationReason || 'none';
+        el.textContent =
+          `камера: ${cap.width || '?'}x${cap.height || '?'} @ ${Math.round(cap.frameRate || 0)} fps\n` +
+          `отправлено: ${r.frameWidth || '?'}x${r.frameHeight || '?'} @ ${Math.round(r.framesPerSecond || 0)} fps\n` +
+          `энкодер: ${r.encoderImplementation || '?'}, powerEfficient: ${r.powerEfficientEncoder}\n` +
+          `битрейт цель: ${Math.round((r.targetBitrate || 0) / 1e5) / 10} Мбит/с\n` +
+          `ограничение: ${lim}` + (lim === 'cpu' ? ' (система не успевает кодировать)' : lim === 'bandwidth' ? ' (канал/оценка канала)' : '');
+      }
+    });
+  } catch {}
+}, 1000);
+
+btn.onclick = () => running ? stop() : start();
+async function restartMedia() {
+  if (!running) return;
+  const old = stream;
+  try { stream = await getMedia(); } catch (e) { setStatus('Ошибка камеры: ' + e.name + (e.constraint ? ' (' + e.constraint + ' не поддерживается, сними "строго")' : ': ' + e.message)); stream = old; return; }
+  preview.srcObject = stream;
+  for (const pc of peers.values()) {
+    for (const s of pc.getSenders()) {
+      const t = stream.getTracks().find(t => s.track && t.kind === s.track.kind);
+      if (t) await s.replaceTrack(t);
+    }
+  }
+  old.getTracks().forEach(t => t.stop());
+}
+['camera', 'res', 'fps'].forEach(id => $(id).onchange = restartMedia);
+$('bitrate').onchange = () => peers.forEach(applyBitrate);
+$('degr').onchange = () => peers.forEach(applyBitrate);
+
+document.addEventListener('visibilitychange', async () => {
+  if (running && document.visibilityState === 'visible') {
+    try { wakeLock = await navigator.wakeLock.request('screen'); } catch {}
+  }
+});
+</script>
+</body>
+</html>
