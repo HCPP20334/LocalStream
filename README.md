@@ -11,10 +11,10 @@
 
 ## Скриншоты
 Телефон
-<img width="1080" height="2460" alt="image" src="https://github.com/user-attachments/assets/4d49ab35-e4d4-49cb-a522-54a87eacd76e" />
+<img width="1080" height="2460" alt="image" src="docs/665117727-4d49ab35-e4d4-49cb-a522-54a87eacd76e.png" />
 
 ПК
-<img width="1920" height="1040" alt="image" src="https://github.com/user-attachments/assets/05ac3c28-3449-4af9-aa7a-efa672777e47" />
+<img width="1920" height="1040" alt="image" src="docs/665117660-05ac3c28-3449-4af9-aa7a-efa672777e47.png" />
 
 Нужен [Node.js](https://nodejs.org) 18+.
 
